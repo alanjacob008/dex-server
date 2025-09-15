@@ -1,3 +1,4 @@
+require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
 const helmet = require('helmet');
@@ -38,8 +39,10 @@ function initializeMotherDuckConnection() {
     const safeDb = String(motherDuckDatabase).replaceAll("'", "''");
     conn.run('INSTALL motherduck;');
     conn.run('LOAD motherduck;');
-    // Attach and alias as md_db for clarity
-    conn.run(`ATTACH '${safeDb}' (TOKEN '${safeToken}') AS md_db;`);
+    // Attach MotherDuck and USE the db name (e.g., md:perps -> perps)
+    conn.run(`ATTACH '${safeDb}' (TOKEN '${safeToken}');`);
+    const dbName = safeDb.includes('md:') ? safeDb.split('md:').pop() : safeDb;
+    conn.run(`USE ${dbName};`);
     motherDuckConnection = conn;
     console.log('✅ MotherDuck connection initialized');
   } catch (error) {
@@ -82,30 +85,18 @@ app.get('/api/md/tables', async (req, res, next) => {
       return res.status(503).json({ error: 'MotherDuck not configured. Set MOTHERDUCK_TOKEN.' });
     }
     const schemaFilter = req.query.schema ? `AND table_schema = '${req.query.schema}'` : '';
-    // Prefer listing from attached md_db catalog if available
+    const includeViews = String(req.query.includeViews || '').toLowerCase() === 'true';
+    const typeFilter = includeViews ? "IN ('BASE TABLE','VIEW')" : "= 'BASE TABLE'";
     const sql = `
-      SELECT table_catalog, table_schema, table_name
-      FROM md_db.information_schema.tables
-      WHERE table_type = 'BASE TABLE'
+      SELECT table_catalog, table_schema, table_name, table_type
+      FROM information_schema.tables
+      WHERE table_type ${typeFilter}
         AND table_schema NOT IN ('information_schema', 'pg_catalog')
         ${schemaFilter}
       ORDER BY table_catalog, table_schema, table_name
     `;
     motherDuckConnection.all(sql, (err, rows) => {
-      if (err) {
-        // Fallback to default information_schema if md_db prefix fails
-        return motherDuckConnection.all(
-          `SELECT table_catalog, table_schema, table_name
-           FROM information_schema.tables
-           WHERE table_type = 'BASE TABLE'
-             AND table_schema NOT IN ('information_schema', 'pg_catalog')
-           ORDER BY table_catalog, table_schema, table_name`,
-          (err2, rows2) => {
-            if (err2) return next(err2);
-            res.json({ tables: rows2, note: 'Listed from default information_schema (fallback)' });
-          }
-        );
-      }
+      if (err) return next(err);
       res.json({ tables: rows });
     });
   } catch (error) {
@@ -127,25 +118,13 @@ app.get('/api/md/diagnostics', async (req, res) => {
     motherDuckConnection.all('SELECT current_database() AS current_database;', (e2, currentDb) => {
       if (e2) result.errors.current_database = String(e2.message || e2);
       else result.current_database = currentDb?.[0]?.current_database || null;
-      // Step 3: schemata from md_db or fallback
-      motherDuckConnection.all('SELECT schema_name FROM md_db.information_schema.schemata ORDER BY schema_name;', (e3, schemas) => {
-        if (e3) {
-          result.errors.schemata_md_db = String(e3.message || e3);
-          return motherDuckConnection.all('SELECT schema_name FROM information_schema.schemata ORDER BY schema_name;', (e3b, schemas2) => {
-            if (e3b) result.errors.schemata_default = String(e3b.message || e3b);
-            else result.schemas = schemas2;
-            // Step 4: table count fallback
-            motherDuckConnection.all('SELECT COUNT(*) AS table_count FROM information_schema.tables;', (e4b, count2) => {
-              if (e4b) result.errors.table_count_default = String(e4b.message || e4b);
-              else result.table_count = count2?.[0]?.table_count ?? null;
-              return res.json(result);
-            });
-          });
-        }
-        result.schemas = schemas;
-        // Step 4: table count in md_db
-        motherDuckConnection.all('SELECT COUNT(*) AS table_count FROM md_db.information_schema.tables;', (e4, count) => {
-          if (e4) result.errors.table_count_md_db = String(e4.message || e4);
+      // Step 3: schemata (no aliasing needed after USE)
+      motherDuckConnection.all('SELECT schema_name FROM information_schema.schemata ORDER BY schema_name;', (e3, schemas) => {
+        if (e3) result.errors.schemata = String(e3.message || e3);
+        else result.schemas = schemas;
+        // Step 4: table count
+        motherDuckConnection.all('SELECT COUNT(*) AS table_count FROM information_schema.tables;', (e4, count) => {
+          if (e4) result.errors.table_count = String(e4.message || e4);
           else result.table_count = count?.[0]?.table_count ?? null;
           return res.json(result);
         });
@@ -207,12 +186,35 @@ app.use((err, req, res, next) => {
   });
 });
 
-// Start server
-app.listen(PORT, () => {
-  console.log(`🚀 Server is running on port ${PORT}`);
+// Start server and add lifecycle logging
+const server = app.listen(PORT, '0.0.0.0', () => {
+  console.log(`🚀 Server is running on port ${PORT} (pid ${process.pid})`);
   console.log(`📍 Local: http://localhost:${PORT}`);
   console.log(`📍 API Health: http://localhost:${PORT}/api/health`);
   console.log(`📍 Hello World: http://localhost:${PORT}/api/hello`);
+});
+
+server.on('error', (err) => {
+  console.error('HTTP server error:', err);
+});
+
+server.on('close', () => {
+  console.warn('HTTP server closed');
+});
+
+process.on('uncaughtException', (err) => {
+  console.error('Uncaught Exception:', err);
+});
+
+process.on('unhandledRejection', (reason) => {
+  console.error('Unhandled Rejection:', reason);
+});
+
+['SIGINT', 'SIGTERM'].forEach((sig) => {
+  process.on(sig, () => {
+    console.log(`Received ${sig}, shutting down...`);
+    server.close(() => process.exit(0));
+  });
 });
 
 module.exports = app;
