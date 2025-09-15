@@ -78,13 +78,76 @@ app.get('/api/md/tables', async (req, res, next) => {
     if (!motherDuckConnection) {
       return res.status(503).json({ error: 'MotherDuck not configured. Set MOTHERDUCK_TOKEN.' });
     }
-    motherDuckConnection.all(
-      "SELECT table_catalog, table_schema, table_name FROM information_schema.tables WHERE table_schema NOT IN ('information_schema', 'pg_catalog') ORDER BY table_catalog, table_schema, table_name",
-      (err, rows) => {
-        if (err) return next(err);
-        res.json({ tables: rows });
+    const schemaFilter = req.query.schema ? `AND table_schema = '${req.query.schema}'` : '';
+    // Prefer listing from attached md_db catalog if available
+    const sql = `
+      SELECT table_catalog, table_schema, table_name
+      FROM md_db.information_schema.tables
+      WHERE table_type = 'BASE TABLE'
+        AND table_schema NOT IN ('information_schema', 'pg_catalog')
+        ${schemaFilter}
+      ORDER BY table_catalog, table_schema, table_name
+    `;
+    motherDuckConnection.all(sql, (err, rows) => {
+      if (err) {
+        // Fallback to default information_schema if md_db prefix fails
+        return motherDuckConnection.all(
+          `SELECT table_catalog, table_schema, table_name
+           FROM information_schema.tables
+           WHERE table_type = 'BASE TABLE'
+             AND table_schema NOT IN ('information_schema', 'pg_catalog')
+           ORDER BY table_catalog, table_schema, table_name`,
+          (err2, rows2) => {
+            if (err2) return next(err2);
+            res.json({ tables: rows2, note: 'Listed from default information_schema (fallback)' });
+          }
+        );
       }
-    );
+      res.json({ tables: rows });
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+// Diagnostics to understand what is attached and visible
+app.get('/api/md/diagnostics', async (req, res, next) => {
+  try {
+    if (!motherDuckConnection) {
+      return res.status(503).json({ error: 'MotherDuck not configured. Set MOTHERDUCK_TOKEN.' });
+    }
+    motherDuckConnection.all('PRAGMA database_list;', (e1, dbList) => {
+      if (e1) return next(e1);
+      motherDuckConnection.all('SELECT current_database() AS current_database;', (e2, currentDb) => {
+        if (e2) return next(e2);
+        motherDuckConnection.all('SELECT schema_name FROM md_db.information_schema.schemata ORDER BY schema_name;', (e3, schemas) => {
+          if (e3) {
+            // Try fallback schemata without md_db prefix
+            return motherDuckConnection.all('SELECT schema_name FROM information_schema.schemata ORDER BY schema_name;', (e3b, schemas2) => {
+              if (e3b) return next(e3b);
+              motherDuckConnection.all('SELECT COUNT(*) AS table_count FROM information_schema.tables;', (e4b, count2) => {
+                if (e4b) return next(e4b);
+                res.json({
+                  database_list: dbList,
+                  current_database: currentDb?.[0]?.current_database,
+                  schemas: schemas2,
+                  table_count: count2?.[0]?.table_count
+                });
+              });
+            });
+          }
+          motherDuckConnection.all('SELECT COUNT(*) AS table_count FROM md_db.information_schema.tables;', (e4, count) => {
+            if (e4) return next(e4);
+            res.json({
+              database_list: dbList,
+              current_database: currentDb?.[0]?.current_database,
+              schemas,
+              table_count: count?.[0]?.table_count
+            });
+          });
+        });
+      });
+    });
   } catch (error) {
     next(error);
   }
