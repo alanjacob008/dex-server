@@ -110,47 +110,56 @@ app.get('/api/md/tables', async (req, res, next) => {
   }
 });
 
-// Diagnostics to understand what is attached and visible
-app.get('/api/md/diagnostics', async (req, res, next) => {
-  try {
-    if (!motherDuckConnection) {
-      return res.status(503).json({ error: 'MotherDuck not configured. Set MOTHERDUCK_TOKEN.' });
-    }
-    motherDuckConnection.all('PRAGMA database_list;', (e1, dbList) => {
-      if (e1) return next(e1);
-      motherDuckConnection.all('SELECT current_database() AS current_database;', (e2, currentDb) => {
-        if (e2) return next(e2);
-        motherDuckConnection.all('SELECT schema_name FROM md_db.information_schema.schemata ORDER BY schema_name;', (e3, schemas) => {
-          if (e3) {
-            // Try fallback schemata without md_db prefix
-            return motherDuckConnection.all('SELECT schema_name FROM information_schema.schemata ORDER BY schema_name;', (e3b, schemas2) => {
-              if (e3b) return next(e3b);
-              motherDuckConnection.all('SELECT COUNT(*) AS table_count FROM information_schema.tables;', (e4b, count2) => {
-                if (e4b) return next(e4b);
-                res.json({
-                  database_list: dbList,
-                  current_database: currentDb?.[0]?.current_database,
-                  schemas: schemas2,
-                  table_count: count2?.[0]?.table_count
-                });
-              });
-            });
-          }
-          motherDuckConnection.all('SELECT COUNT(*) AS table_count FROM md_db.information_schema.tables;', (e4, count) => {
-            if (e4) return next(e4);
-            res.json({
-              database_list: dbList,
-              current_database: currentDb?.[0]?.current_database,
-              schemas,
-              table_count: count?.[0]?.table_count
+// Diagnostics to understand what is attached and visible (robust, never throws)
+app.get('/api/md/diagnostics', async (req, res) => {
+  if (!motherDuckConnection) {
+    return res.status(503).json({ error: 'MotherDuck not configured. Set MOTHERDUCK_TOKEN.' });
+  }
+  const result = { database_list: null, current_database: null, schemas: null, table_count: null, errors: {} };
+  // Step 1: PRAGMA database_list
+  motherDuckConnection.all('PRAGMA database_list;', (e1, dbList) => {
+    if (e1) result.errors.database_list = String(e1.message || e1);
+    else result.database_list = dbList;
+    // Step 2: current_database()
+    motherDuckConnection.all('SELECT current_database() AS current_database;', (e2, currentDb) => {
+      if (e2) result.errors.current_database = String(e2.message || e2);
+      else result.current_database = currentDb?.[0]?.current_database || null;
+      // Step 3: schemata from md_db or fallback
+      motherDuckConnection.all('SELECT schema_name FROM md_db.information_schema.schemata ORDER BY schema_name;', (e3, schemas) => {
+        if (e3) {
+          result.errors.schemata_md_db = String(e3.message || e3);
+          return motherDuckConnection.all('SELECT schema_name FROM information_schema.schemata ORDER BY schema_name;', (e3b, schemas2) => {
+            if (e3b) result.errors.schemata_default = String(e3b.message || e3b);
+            else result.schemas = schemas2;
+            // Step 4: table count fallback
+            motherDuckConnection.all('SELECT COUNT(*) AS table_count FROM information_schema.tables;', (e4b, count2) => {
+              if (e4b) result.errors.table_count_default = String(e4b.message || e4b);
+              else result.table_count = count2?.[0]?.table_count ?? null;
+              return res.json(result);
             });
           });
+        }
+        result.schemas = schemas;
+        // Step 4: table count in md_db
+        motherDuckConnection.all('SELECT COUNT(*) AS table_count FROM md_db.information_schema.tables;', (e4, count) => {
+          if (e4) result.errors.table_count_md_db = String(e4.message || e4);
+          else result.table_count = count?.[0]?.table_count ?? null;
+          return res.json(result);
         });
       });
     });
-  } catch (error) {
-    next(error);
+  });
+});
+
+// Simple ping to test connectivity to MotherDuck
+app.get('/api/md/ping', (req, res, next) => {
+  if (!motherDuckConnection) {
+    return res.status(503).json({ error: 'MotherDuck not configured. Set MOTHERDUCK_TOKEN.' });
   }
+  motherDuckConnection.all('SELECT 1 AS ok;', (err, rows) => {
+    if (err) return next(err);
+    res.json({ rows });
+  });
 });
 
 // Cautious read-only query endpoint. Only allows SELECT statements.
