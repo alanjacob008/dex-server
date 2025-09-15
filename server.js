@@ -33,10 +33,13 @@ function initializeMotherDuckConnection() {
   try {
     motherDuckDb = new duckdb.Database(':memory:');
     const conn = motherDuckDb.connect();
-    // Set token
-    conn.run(`SET motherduck_token='${motherDuckToken}';`);
-    // Open the MotherDuck database alias
-    conn.run(`ATTACH '${motherDuckDatabase}' AS md_db;`);
+    // Ensure motherduck extension is available and loaded, then attach with TOKEN
+    const safeToken = String(motherDuckToken).replaceAll("'", "''");
+    const safeDb = String(motherDuckDatabase).replaceAll("'", "''");
+    conn.run('INSTALL motherduck;');
+    conn.run('LOAD motherduck;');
+    // Attach and alias as md_db for clarity
+    conn.run(`ATTACH '${safeDb}' (TOKEN '${safeToken}') AS md_db;`);
     motherDuckConnection = conn;
     console.log('✅ MotherDuck connection initialized');
   } catch (error) {
